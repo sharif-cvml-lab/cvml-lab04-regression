@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+venv/
+.venv/
+# trained models are produced locally; the MediaPipe task file stays tracked
+assets/models/trained/
+assets/models/trained.old/
+assets/models/.staging_*/
+assets/examples/output/
