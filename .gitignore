@@ -6,4 +6,5 @@ venv/
 assets/models/trained/
 assets/models/trained.old/
 assets/models/.staging_*/
+assets/models/*.joblib
 assets/examples/output/

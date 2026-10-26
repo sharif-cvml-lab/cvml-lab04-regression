@@ -1,114 +1,160 @@
-"""Lab 04 - Regression: the ONLY file students edit.
+"""Lab 04 - head-pose regression.   >>> THIS IS THE ONLY FILE STUDENTS MODIFY <<<
 
-The application around this file is complete. It already
-  * extracts the 478 facial landmarks of every webcam frame (MediaPipe),
-  * calls  predict_angles()  for each frame and moves the virtual pointer with the result,
-  * calls  train_models()    (in a background thread) when you press the Train button.
+The application detects 478 facial landmarks (fixed code), calls YOUR functions
+to learn / predict the head angles, and moves a virtual pointer with the result.
 
-Until you complete the two functions below, the app still runs: it shows the camera and the
-landmarks, and reports "not implemented" / "models not trained yet" instead of crashing.
+Conventions you must know (all verified on the supplied dataset):
+  * Landmarks: np.ndarray of shape (478, 2), columns (x, y), pixel coordinates.
+  * Dataset angles (pitch, yaw, roll) are stored in RADIANS.
+  * The models are trained in and predict DEGREES.
+  * Output order is ALWAYS (pitch, yaw, roll) - see ANGLE_NAMES.
 
-Conventions you must follow (they make training and inference consistent):
-  * Features : face_landmarker.landmarks_to_feature_vector(points) -> shape (956,) or None.
-               Use it in BOTH functions. Never write your own normalization.
-  * Targets  : pitch, yaw, roll, always in this order.
-  * Units    : the CSV stores angles in RADIANS.  Models are trained in DEGREES.
-               Convert once, with np.degrees(), while preparing the targets in train_models().
-  * Files    : save the three models with joblib.dump() to the paths returned by
-               model_store.model_paths(model_dir).  Do NOT write metadata.json - the app does it.
+Provided helpers you may (and should) use:
+  landmarks.normalize_landmarks(points)  -> feature vector of 956 values.
+        Centers on landmark 99, divides by the distance between landmarks 10
+        and 171, returns [x_0..x_477, y_0..y_477]. Raises ValueError on bad input.
+  dataset.load_dataset_table(path)       -> (pandas table, report text).
+        Validates the CSV; raises DatasetError (a ValueError) with a readable message.
+  model_store.save_model_bundle(...)     -> saves the 3 models safely (atomic).
+  model_store.load_model_bundle(...)     -> loads (and caches) them. Raises ModelStoreError.
+Do not edit any other file.
 """
-import joblib
+from __future__ import annotations
+
 import numpy as np
-import pandas as pd
-from sklearn.linear_model import Lasso, LinearRegression, Ridge
 
-import model_store
-from config import ANGLE_NAMES, MAX_VALID_ANGLE_DEG, MIN_TRAINING_SAMPLES, NUM_LANDMARKS
-from face_landmarker import landmarks_to_feature_vector
+# Allowed building blocks (import what you need; extend this list if necessary).
+from sklearn.linear_model import Lasso, LinearRegression, Ridge  # noqa: F401
+from sklearn.model_selection import train_test_split  # noqa: F401
+
+from config import (  # noqa: F401
+    ANGLE_LIMIT_DEG,
+    ANGLE_NAMES,
+    LASSO_ALPHA,
+    LASSO_MAX_ITER,
+    MIN_TRAIN_SAMPLES,
+    MODEL_TYPES,
+    NUM_LANDMARKS,
+    RANDOM_SEED,
+    RIDGE_ALPHA,
+    VALIDATION_FRACTION,
+)
+from dataset import DatasetError, coordinate_columns, load_dataset_table  # noqa: F401
+from landmarks import normalize_landmarks  # noqa: F401
+from model_store import ModelStoreError, load_model_bundle, save_model_bundle  # noqa: F401
 
 
-# =============================================================================
-# TASK 1 - Training
-# =============================================================================
-def train_models(dataset_path: str, model_type: str, model_dir: str, alpha: float = 1.0) -> dict:
-    """Train one regression model each for pitch, yaw and roll, and save them.
-
-    Args:
-        dataset_path: CSV file with columns filename, pitch, yaw, roll, x_0, y_0, ..., x_477, y_477.
-        model_type:   "Linear", "Ridge" or "Lasso".
-        model_dir:    folder where the three .joblib files must be saved (it already exists).
-        alpha:        regularization strength (used by Ridge and Lasso, ignored by Linear).
-
-    Returns:
-        {"success": True,  "message": "...", "n_samples": <number of samples used for training>}
-        {"success": False, "message": "<what went wrong, in plain English>"}
+def train_models(
+    dataset_path: str,
+    model_type: str,
+    model_dir: str,
+) -> tuple[bool, str]:
     """
-    # TODO 1: Load the dataset with pd.read_csv(dataset_path).
-    #         If it cannot be read, return {"success": False, "message": "..."}.
+    TODO: Train one regressor per angle (pitch, yaw, roll) and save them.
 
-    # TODO 2: Build the list of coordinate column names in the correct (interleaved) order:
-    #             x_0, y_0, x_1, y_1, ..., x_477, y_477
-    #         (use a for-loop over range(NUM_LANDMARKS)).  Check that these columns and
-    #         "pitch", "yaw", "roll" exist; if some are missing, return a failure message.
+    IMPORTANT:
+    - Keep this function signature unchanged.
+    - Return (True, "message") on success and (False, "reason") on failure.
+      Failure is a normal answer: never let an exception escape (use try/except
+      around the work and return (False, str(error))).
+    - Do not touch the GUI, the camera or any file other than through
+      save_model_bundle().
 
-    # TODO 3: Get the coordinates as a NumPy array and reshape it to (number_of_samples, NUM_LANDMARKS, 2).
-    #         Because the columns are interleaved, df[coordinate_columns].to_numpy().reshape(-1, NUM_LANDMARKS, 2)
-    #         gives landmarks[i, j] = (x_j, y_j) of sample i.
+    Arguments:
+      dataset_path : path of the CSV file chosen in the GUI.
+      model_type   : "linear", "ridge" or "lasso" (see MODEL_TYPES).
+      model_dir    : directory where the models must be saved.
 
-    # TODO 4: Read the three label columns, convert radians -> degrees with np.degrees().
+    Expected implementation sequence:
 
-    # TODO 5: Loop over the samples. Skip a sample when
-    #           - one of its angles is not finite (np.isfinite), or
-    #           - one of its angles has an absolute value above MAX_VALID_ANGLE_DEG
-    #             (the dataset contains a few wrapped / invalid labels), or
-    #           - landmarks_to_feature_vector(points) returns None.
-    #         Collect the feature vectors and the (pitch, yaw, roll) targets of the kept samples.
-    #         Convert both lists to NumPy arrays X (n, 956) and Y (n, 3).
-    #         If fewer than MIN_TRAINING_SAMPLES samples remain, return a failure message.
+    1. Validate the arguments. Fail if model_type is not in MODEL_TYPES.
 
-    # TODO 6: For each of the three angles (index 0, 1, 2 in ANGLE_NAMES):
-    #           a) create the estimator for model_type:
-    #                "Linear" -> LinearRegression()
-    #                "Ridge"  -> Ridge(alpha=alpha)
-    #                "Lasso"  -> Lasso(alpha=alpha, max_iter=5000)
-    #              (any other model_type -> failure message)
-    #           b) train it:      model.fit(X, Y[:, index])
-    #           c) save it:       joblib.dump(model, model_store.model_paths(model_dir)[name])
+    2. Load the data with load_dataset_table(dataset_path). It raises
+       DatasetError for missing files / columns / bad values - turn that into
+       (False, message). Keep the returned `report` text for your final message.
 
-    # TODO 7: Return {"success": True, "message": "...", "n_samples": X.shape[0]}.
+    3. Separate FEATURES from TARGETS:
+         - targets : the three columns in ANGLE_NAMES, shape (N, 3), in RADIANS;
+         - landmarks : the columns from coordinate_columns() (x_0, y_0, x_1, ...),
+           reshaped to (N, NUM_LANDMARKS, 2). The column order is interleaved
+           x/y, so a plain reshape gives the (x, y) pair of every landmark.
 
-    return {
-        "success": False,
-        "message": "train_models() is not implemented yet. Complete the TODOs in regression.py.",
-    }
+    4. Convert the targets to DEGREES (np.degrees).
 
+    5. Remove extreme samples: keep a sample only if ALL THREE absolute angles
+       are <= ANGLE_LIMIT_DEG. (The raw data contains a few impossible values.)
+       Fail if fewer than MIN_TRAIN_SAMPLES samples remain.
 
-# =============================================================================
-# TASK 2 - Inference
-# =============================================================================
-def predict_angles(landmarks: np.ndarray, model_dir: str):
-    """Estimate (pitch, yaw, roll) in DEGREES from the landmarks of ONE frame.
+    6. Build the feature matrix X of shape (N_kept, 956): use a loop over the
+       kept samples and call normalize_landmarks(...) on each (478, 2) array.
+       If it raises ValueError, skip that sample and count it.
+       Why this step? (position and face size would otherwise dominate)
 
-    Args:
-        landmarks: array of shape (478, 2) with pixel coordinates (row i = landmark i).
-        model_dir: folder that contains the trained models.
+    7. Split X and the (N_kept, 3) targets into training and validation parts
+       with train_test_split(..., test_size=VALIDATION_FRACTION,
+       random_state=RANDOM_SEED).
 
-    Returns:
-        (pitch, yaw, roll) as three Python floats, or None if no estimate can be made
-        (invalid landmarks, models not trained / not loadable, invalid prediction).
-        Never return made-up numbers.
+    8. For EACH angle (pitch, yaw, roll) create a NEW estimator for model_type:
+         "linear" -> LinearRegression()
+         "ridge"  -> Ridge(alpha=RIDGE_ALPHA)
+         "lasso"  -> Lasso(alpha=LASSO_ALPHA, max_iter=LASSO_MAX_ITER)
+       and fit it on the training part with that angle as the target.
+       Keep the three fitted estimators in a dict {"pitch": ..., "yaw": ..., "roll": ...}.
+
+    9. Evaluate: predict the validation part and compute the mean absolute
+       error in degrees for each angle (np.mean(np.abs(prediction - truth))).
+
+    10. Save with save_model_bundle(model_dir, model_type, models, metadata)
+        where metadata is a dict such as
+        {"num_samples": ..., "validation_mae_deg": {"pitch": ..., "yaw": ..., "roll": ...}}.
+        It raises ModelStoreError on failure.
+
+    11. Return (True, text) where text mentions the number of samples used,
+        any rows/samples that were skipped, and the three validation errors.
     """
-    # TODO 1: Convert the landmarks to a feature vector with landmarks_to_feature_vector().
-    #         If it returns None, return None.
+    # TODO: Delete this placeholder and implement the steps above.
+    return False, (
+        "train_models() is not implemented yet. Open regression.py and complete "
+        "the TODO in train_models()."
+    )
 
-    # TODO 2: Get the three trained models with model_store.load_models(model_dir).
-    #         It returns (pitch_model, yaw_model, roll_model) or None. If None, return None.
-    #         (It caches the models, so it is cheap to call for every frame.)
 
-    # TODO 3: scikit-learn expects a 2-D array: features.reshape(1, -1).
-    #         Predict with each model:  float(model.predict(x)[0])  -> pitch, yaw, roll.
+def predict_angles(
+    landmarks: np.ndarray,
+    model_dir: str,
+) -> tuple[float, float, float] | None:
+    """
+    TODO: Predict (pitch, yaw, roll) in DEGREES from one face's landmarks.
 
-    # TODO 4: If any prediction is not finite (np.isfinite), return None.
-    #         Otherwise return (pitch, yaw, roll).
+    IMPORTANT:
+    - Keep this function signature unchanged.
+    - It is called for every video frame: do not read files yourself and do not
+      print. load_model_bundle() already caches the models in memory.
+    - Return None (never raise) if the input is invalid or no usable models exist.
 
+    Arguments:
+      landmarks : np.ndarray, shape (478, 2), pixel (x, y) coordinates of ONE face,
+                  in the same convention as the dataset.
+      model_dir : directory that contains the saved models.
+
+    Expected implementation sequence:
+
+    1. Validate `landmarks`: it must be a numpy array of shape (NUM_LANDMARKS, 2)
+       with only finite values. Otherwise return None.
+
+    2. Get the trained models: bundle = load_model_bundle(model_dir).
+       It raises ModelStoreError when there are no (valid) models -> return None.
+       The estimators are in bundle.models["pitch" / "yaw" / "roll"].
+
+    3. Preprocess EXACTLY like in training: features = normalize_landmarks(landmarks)
+       (catch ValueError -> return None). Reshape to (1, 956) because
+       scikit-learn expects a 2-D array of samples.
+
+    4. For each name in ANGLE_NAMES call .predict(features) on that angle's
+       estimator and take the single value as a float.
+       Return None if any value is not finite.
+
+    5. Return (pitch, yaw, roll) as three Python floats in DEGREES, in this order.
+    """
+    # TODO: Delete this placeholder and implement the steps above.
     return None

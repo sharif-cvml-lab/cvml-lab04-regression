@@ -1,121 +1,146 @@
-# Lab 04 - Regression: Head-Controlled Virtual Pointer
+# Lab04_Regression
 
 Welcome to the fourth assignment of the Computer Vision and Machine Learning lab course!
 
-This project is a real-time PyQt6 application in which your head moves a **virtual pointer**. MediaPipe finds 478 facial landmarks in every webcam frame; three regression models you train (one each for **pitch, yaw and roll**) turn those landmarks into head-pose angles; the angles move the pointer. Everything around the models is provided. Your job is the regression part.
+This project is a real-time PyQt6 application in which your **head controls a virtual pointer**. A fixed pipeline detects 478 facial landmarks; **regression models that you train** turn the landmarks into head angles (**pitch, yaw, roll**); the angles move the pointer. Your job is the machine-learning part: *training* the regressors and *predicting* with them.
 
-## Assignment objectives
+## 🎯 Assignment Objectives
 
-Complete two functions in `regression.py` (the only file you edit):
+Complete two functions in `regression.py` (the **only** file you modify):
 
 ```python
-def train_models(dataset_path: str, model_type: str, model_dir: str, alpha: float = 1.0) -> dict
+def train_models(dataset_path: str, model_type: str, model_dir: str) -> tuple[bool, str]
 def predict_angles(landmarks: np.ndarray, model_dir: str) -> tuple[float, float, float] | None
 ```
 
-You will practice: loading a labeled dataset, separating features from targets, normalizing landmarks, converting units (radians to degrees), cleaning invalid samples, training Linear / Ridge / Lasso regression with scikit-learn (`.fit()`), saving models, and predicting on new data with *exactly* the same preprocessing.
+You will practice: separating features from targets, cleaning data, feature normalization, Linear / Ridge / Lasso regression with scikit-learn, a train/validation split and MAE, saving a model, and using exactly the same preprocessing at training and prediction time.
 
-Do not modify any other file. The detailed step-by-step TODOs are inside `regression.py`.
+Do not modify `main.py`, `gui.py`, `video_thread.py`, `training_worker.py`, `annotation.py`, `landmarks.py`, `dataset.py`, `model_store.py`, `pointer.py`, `config.py`, `requirements.txt`, or the assets. You must be able to explain every line of your two functions in the oral assessment.
 
 ### Pipeline
 
 ```
-Dataset CSV --> landmark columns (478 x 2) --> landmarks_to_feature_vector() (fixed) --> X (n, 956)
-                angle columns (radians) --> np.degrees --> drop invalid --> Y (n, 3)
-train_models()   YOUR CODE: for pitch, yaw, roll: model = Ridge/Lasso/Linear; model.fit(X, y); joblib.dump(...)
-
-Webcam frame --> MediaPipe landmarks (fixed) --> predict_angles()   YOUR CODE: features -> models -> (pitch, yaw, roll)
-             --> smoothing + centre calibration + mapping (fixed) --> virtual pointer
+camera / image / video ──► MediaPipe landmarks (fixed) ──► (478, 2) pixel points
+                                                              │
+        training:  dataset CSV ──► YOUR train_models()        │
+                      load → split features/targets → degrees → clean → normalize_landmarks()
+                      → split train/validation → fit pitch/yaw/roll regressors → MAE → save
+                                                              ▼
+        prediction:                                  YOUR predict_angles()
+                      validate → load models (cached) → normalize_landmarks() → predict
+                                                              │  (pitch, yaw, roll) in degrees
+                                                              ▼
+              fixed: calibration → smoothing → virtual pointer + camera overlay
 ```
 
-## Features
+The detailed step-by-step instructions are in the docstrings (TODO) of `regression.py`.
 
-- Webcam view (mirror option, landmark overlay, face status, FPS) and a **Virtual Pointer** arena with trail and roll-rotated pointer.
-- Choose **Linear**, **Ridge** or **Lasso** regression and `alpha`; training runs in a background thread with a busy indicator.
-- Models are written to a staging folder and installed only if complete, so a failed training never destroys previously valid models.
-- Set Center / Clear Center, Invert X / Y, Yaw and Pitch range, Smoothing, trail on/off.
-- **Test on Image...** runs the pipeline on one image (a single image cannot show continuous pointer motion).
-- Dark and light theme, resizable layout, settings restored between sessions, full-screen mode.
-- Runs before you write any code and without a camera (the app then shows a clear message).
+### Conventions (verified on the supplied dataset)
 
-## Setup
+| Item | Convention |
+|---|---|
+| Landmarks | 478 points, shape `(478, 2)`, `(x, y)` pixels of the original un-mirrored image, truncated to integers |
+| Features | `normalize_landmarks(points)` → 956 values `[x_0..x_477, y_0..y_477]`, centered on landmark 99, divided by the distance of landmarks 10 and 171 |
+| Dataset angles | pitch, yaw, roll in **radians** |
+| Model targets / predictions | **degrees**, order always `(pitch, yaw, roll)` |
+| Signs | yaw > 0 = user turns to *their* right · pitch > 0 = looks up · roll > 0 = tilts to *their* left shoulder |
+| Models | one `assets/models/head_pose_regressors.joblib` (3 estimators + metadata), written atomically |
 
-Python 3.9 - 3.12 is recommended (MediaPipe wheels). Tested here with Python 3.12.
+Before you implement anything the application already runs: `train_models` reports "not implemented" and `predict_angles` returns `None`; the GUI shows this clearly and nothing crashes.
+
+## 🛠️ Setup & Installation
+
+Python 3.10 – 3.12 is recommended (the versions MediaPipe supports). Windows and Linux, CPU only.
 
 ```
 python -m venv venv
-```
-
-Linux / macOS: `source venv/bin/activate` - Windows PowerShell: `venv\Scripts\Activate.ps1`
-
-```
+source venv/bin/activate          # Linux/macOS
+venv\Scripts\Activate.ps1         # Windows PowerShell
 pip install -r requirements.txt
 python main.py
 ```
 
-`assets/models/face_landmarker.task` and `assets/dataset/AFLW2000_landmarks.csv` are included locally; nothing is downloaded at runtime.
+Required assets (already in the repository):
 
-## Using the application
+- `assets/models/face_landmarker.task` – MediaPipe landmark model (never deleted by the app)
+- `assets/dataset/AFLW2000_landmarks.csv` – training data (format: `assets/dataset/README.md`)
 
-1. **Train:** the dataset (default AFLW2000) is pre-selected. Pick an algorithm and `alpha`, press **Train**. The status shows the active models and, if available, held-out MAE in degrees (error on unseen dataset samples - not a guarantee of pointer quality). Defaults: Ridge alpha 1, Lasso alpha 0.01 (Lasso is slower). Linear ignores alpha.
-2. **Look at the pointer:** turn your head right and the pointer moves right; look up and it moves up; tilting your head rotates the pointer.
-3. **Calibrate:** sit comfortably, look at the screen, press **Set Center**. It refuses to save when no valid pose is available. **Clear Center** returns to 0/0/0 degrees. The center is not persisted between sessions.
-4. **Tune:** *Yaw Range* / *Pitch Range* = head angle that reaches the arena edge (smaller = more sensitive). *Smoothing* higher = steadier but slower (exponential moving average). Pointer movement stays inside the arena.
-5. **Remove Trained Models** (with confirmation) deletes only the three model files and `metadata.json` from `assets/models/trained/`. **Reset to Defaults** resets only GUI/pointer settings.
+MediaPipe installs `opencv-contrib-python`; `main.py` removes the Qt plugin path that this package sets on Linux so that it does not clash with PyQt6. If you still get a `xcb` plugin error on Linux, install `libxcb-cursor0`.
 
-If you change the algorithm, alpha or dataset after training, the status line tells you that the active models differ and that you must press Train again; predictions always come from the active models.
+## 🎮 Using the Application
 
-Shortcuts: `Space` pause/resume - `F11` full screen - `R` reset defaults - `Q` quit.
+### Input source
 
-## Conventions (important)
+- **Webcam** (default). If it cannot be opened the app keeps running ("Camera could not be opened") – change the camera index or load a file instead.
+- **Open Image/Video…** loads a still image or a video file. A still image is analysed once (and again when you change a setting); a video plays with Pause/Resume and Restart Source.
+- All three sources use the same processing and display. Switching sources resets the pointer and clears the center.
 
-| Item | Convention |
-|---|---|
-| Landmarks | 478 points, `(478, 2)` pixel coordinates; CSV columns interleaved `x_0, y_0, x_1, ...` |
-| Features | `face_landmarker.landmarks_to_feature_vector()` - subtract landmark 99, divide by distance between landmarks 10 and 171, layout `[x..., y...]` (956 values). Use it in training **and** inference. |
-| Angle units | CSV: **radians**. Models and GUI: **degrees**. Convert once with `np.degrees` in `train_models()`. |
-| Output order | `(pitch, yaw, roll)` |
-| Invalid labels | Samples with any `|angle| > 75 deg` (23 wrapped values in the supplied file) or non-finite values are skipped |
-| Directions | positive yaw = head turned to the user's right, positive pitch = looking up, positive roll = tilt toward the user's left shoulder |
-| Return values | `train_models` -> `{"success": bool, "message": str, "n_samples": int}`; `predict_angles` -> 3 floats or `None` (never invented numbers) |
+### Train a model
 
-Until you finish the TODOs, `train_models` reports "not implemented" and `predict_angles` returns `None`; the app shows "Models not trained yet" instead of failing.
+1. Choose a dataset with **Browse…** (default: the AFLW2000 CSV; CSV only).
+2. Pick **Linear / Ridge / Lasso Regression**.
+3. Press **Train**. Training runs in the background (a few seconds; Lasso is the slowest). Training never starts automatically.
+4. On success the models are saved in `assets/models/` and used immediately; they are loaded automatically at the next launch. A failed training keeps the previous valid models.
+5. **Delete Models…** (with confirmation) removes only the trained-model file, never `face_landmarker.task` or the dataset.
 
-## Dataset
+The status line under *Regression Model* shows whether usable models exist and their validation error (MAE in degrees for pitch / yaw / roll).
 
-See `assets/dataset/README.txt`. To build your own dataset from labeled images see `example_b_prepare_dataset.py`. Only `.csv` files are supported.
+### Pointer
 
-## Standalone examples (`assets/examples/`)
+- **Set Center (`C`)**: current head pose = neutral. Refused when there is no valid face/prediction. **Clear Center** goes back to 0° (the dataset's frontal pose). The center is not saved between sessions.
+- **Yaw / Pitch range**: head angle from the center that moves the pointer to the edge of the area.
+- **Smoothing**: time constant of an exponential filter in ms (0 = off). Larger = steadier but laggier; it is independent of the frame rate.
+- **Invert X / Y**, **Show pointer trail**, **Reset Pointer**. Roll rotates the pointer arrow.
+- No face / invalid prediction: the pointer is **held** for 0.75 s, then shown frozen and dimmed ("No face - pointer frozen"). Old predictions are never reused, and when the face returns the pointer jumps instead of gliding from a stale position.
 
-```
-python assets/examples/example_a_extract_landmarks.py [image]     # landmarks -> annotated image
-python assets/examples/example_b_prepare_dataset.py                # inspect the dataset (or: build IMAGES LABELS OUT)
-python assets/examples/example_c_train_models.py Ridge 1.0         # train + save (Linear | Ridge | Lasso)
-python assets/examples/example_d_predict_single_image.py [image]   # predict angles for one image
-```
-Outputs go to `assets/examples/output/`. Examples C and D are complete reference pipelines (instructors may remove them from the student copy; `instructor/` holds a full `regression.py` solution and must not be distributed).
+### Display
 
-## Repository structure
+Mirror camera view (display only – the model always receives the original frame, otherwise yaw and roll would change sign), show landmarks, show angles. Dark/light theme, full screen, **Reset Defaults** (keeps trained models), settings are saved between sessions.
+
+### Keyboard shortcuts
+
+- `Space` – Pause / Resume (webcam and video)
+- `C` – Set Center
+- `F11` – Full Screen / Windowed
+- `R` – Reset Defaults
+- `Q` – Quit (if training is running you are asked to wait for it to finish)
+
+## 📂 Repository Structure
 
 ```
 cvml-lab04-regression/
-├── main.py              entry point
-├── gui.py               window, themes, controls, settings, shortcuts
-├── video_thread.py      camera/test image, landmarks, inference, FPS
-├── training_thread.py   runs train_models() in the background
-├── regression.py        STUDENT FILE
-├── face_landmarker.py   MediaPipe wrapper + shared feature preprocessing
-├── model_store.py       model paths, metadata, cached loading, safe install/delete
-├── pointer.py           smoothing, calibration, angle -> pointer mapping
-├── config.py            constants and defaults
+├── main.py              # entry point
+├── gui.py               # PyQt6 UI, themes, shortcuts, settings
+├── video_thread.py      # webcam/image/video, landmarks, calls predict_angles, pointer
+├── training_worker.py   # runs train_models in a background thread
+├── regression.py        # ★ THE ONLY FILE STUDENTS MODIFY
+├── landmarks.py         # MediaPipe wrapper + normalize_landmarks (shared preprocessing)
+├── dataset.py           # safe CSV loading / validation
+├── model_store.py       # atomic save, cached load, safe delete of the models
+├── pointer.py           # angles → pointer (calibration, smoothing, hold)
+├── annotation.py        # drawing on frames
+├── config.py            # paths, constants, defaults
 ├── requirements.txt
-├── instructor/regression_solution.py
-├── tests/test_core.py
-└── assets/{dataset,models,examples}/
+├── tests/               # pytest tests of the fixed infrastructure
+└── assets/
+    ├── dataset/         # AFLW2000_landmarks.csv + README.md (format guide)
+    ├── models/          # face_landmarker.task (+ your trained models)
+    └── examples/        # standalone scripts 01–04 + image00013.jpg
 ```
 
-Run the tests: `python -m unittest discover -s tests -v` (they use the instructor solution; no camera or display needed).
+## 🧪 Standalone Examples
 
-## Limitations
+Independent of the GUI; run from anywhere (outputs go to `assets/examples/output/`):
 
-Only the 2D landmark geometry is used, so estimates are approximate (typically a few degrees of MAE on held-out AFLW2000 samples) and weaker for large angles or partly hidden faces. Smoothing is per frame, not per second, so its feel depends on FPS. Models are pickled by joblib: load only model files you trust.
+```
+python assets/examples/01_detect_landmarks.py      # detect + draw landmarks on image00013.jpg
+python assets/examples/02_build_dataset.py         # build a dataset CSV from images + angle labels
+python assets/examples/03_train_regressor.py       # walkthrough of training (--model linear|ridge|lasso)
+python assets/examples/04_predict_angles.py        # predict the three angles of an image
+```
+
+Examples 03–04 show the finished pipeline for reference; write your own `regression.py` rather than copying them – you will be asked to explain it. Use `02_build_dataset.py` (with your own images and labels) to create a custom dataset (see `assets/dataset/README.md`).
+
+## About
+
+Head-pose estimation drives gaze-free interfaces, driver monitoring and AR. Here you see the full chain in miniature: engineered features, a regularized linear model, and a real-time consumer of its predictions. Linear regression on 956 correlated coordinates overfits; compare it with Ridge and Lasso on the validation error and on how steady the pointer feels.

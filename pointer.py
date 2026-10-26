@@ -1,111 +1,135 @@
-"""Fixed infrastructure: turns head-pose angles into a smoothed pointer position.
+"""Fixed infrastructure: maps head angles to a virtual pointer (no Qt, easy to test).
 
-Conventions (angles in degrees, verified on the AFLW2000 labels):
-    positive yaw   = head turned toward the user's own right   -> pointer moves right
-    positive pitch = head tilted up                            -> pointer moves up
-    positive roll  = head tilted toward the user's own left    -> pointer rotates counter-clockwise
-Smoothing is an exponential moving average: smoothed += (1 - s) * (new - smoothed), where s is
-the Smoothing setting (0 = raw, 0.95 = very steady but slow).
+Conventions (angles in degrees, dataset convention - verified on the AFLW2000 data):
+  yaw   > 0 : the user turns their head to THEIR right  -> pointer moves right
+  pitch > 0 : the user looks up                          -> pointer moves up
+  roll  > 0 : the user tilts the head to THEIR left shoulder -> pointer rotates
+              counter-clockwise on screen (like a mirror)
+Pointer position: x in [-1, 1] (right = +), y in [-1, 1] (up = +).
+Smoothing: exponential moving average with a time constant (ms), so the
+behaviour does not depend on the frame rate.
 """
 from __future__ import annotations
 
 import math
+import time
 from dataclasses import dataclass
 
-import config
+from config import (
+    HOLD_SECONDS,
+    MAX_PLAUSIBLE_ANGLE_DEG,
+    MAX_ROLL_DISPLAY_DEG,
+    PointerSettings,
+)
+
+TRACKING = "tracking"  # a valid prediction for the current frame
+HOLDING = "holding"  # no valid prediction for a moment: pointer frozen
+LOST = "lost"  # no valid prediction for a while: pointer frozen, shown as lost
+WAITING = "waiting"  # nothing valid received yet
 
 
-@dataclass
-class PointerSettings:
-    yaw_range: float = config.DEFAULT_YAW_RANGE
-    pitch_range: float = config.DEFAULT_PITCH_RANGE
-    smoothing: float = config.DEFAULT_SMOOTHING / 100.0
-    invert_x: bool = config.DEFAULT_INVERT_X
-    invert_y: bool = config.DEFAULT_INVERT_Y
+@dataclass(frozen=True)
+class PointerState:
+    x: float = 0.0
+    y: float = 0.0
+    roll_deg: float = 0.0  # calibrated head roll (dataset convention)
+    status: str = WAITING
+    calibrated: bool = False
 
 
-def _clip(value, low, high):
-    return max(low, min(high, value))
+def clean_angles(angles) -> tuple[float, float, float] | None:
+    """Return (pitch, yaw, roll) as floats, or None if anything is invalid."""
+    try:
+        values = tuple(float(a) for a in angles)
+    except (TypeError, ValueError):
+        return None
+    if len(values) != 3 or not all(math.isfinite(v) for v in values):
+        return None
+    if any(abs(v) > MAX_PLAUSIBLE_ANGLE_DEG for v in values):
+        return None
+    return values
 
 
-class PointerMapper:
-    def __init__(self, settings=None):
+def _clamp(value: float, limit: float) -> float:
+    return max(-limit, min(limit, value))
+
+
+class PointerController:
+    def __init__(self, settings: PointerSettings | None = None):
         self.settings = settings or PointerSettings()
-        self.center = (0.0, 0.0, 0.0)          # (pitch, yaw, roll) neutral pose
-        self.center_is_set = False
-        self._smoothed = None                  # (pitch, yaw, roll) or None
-        self._missed = 0
-        self._position = (0.0, 0.0)            # x, y in [-1, 1]; +x right, +y DOWN (screen)
-        self._rotation = 0.0                   # degrees, clockwise on screen
+        self._center: tuple[float, float, float] | None = None
+        self._last_angles: tuple[float, float, float] | None = None
+        self._x = self._y = self._roll = 0.0
+        self._last_valid_time: float | None = None
+        self._last_update_time: float | None = None
+        self._status = WAITING
+        self._snap_next = True
 
-    # -- state -------------------------------------------------------------
-    @property
-    def position(self):
-        return self._position
-
-    @property
-    def rotation(self):
-        return self._rotation
+    def set_settings(self, settings: PointerSettings) -> None:
+        self.settings = settings
 
     @property
-    def smoothed_angles(self):
-        return self._smoothed
+    def calibrated(self) -> bool:
+        return self._center is not None
 
-    def reset_smoothing(self):
-        self._smoothed = None
-        self._missed = 0
+    def calibrate(self) -> tuple[bool, str]:
+        """Use the current pose as the neutral pose. Refused without a live valid face."""
+        if self._status != TRACKING or self._last_angles is None:
+            return False, "Cannot set the center: no valid face/prediction right now."
+        self._center = self._last_angles
+        return True, "Center set to the current head pose."
 
-    def reset(self):
-        self.reset_smoothing()
-        self._position = (0.0, 0.0)
-        self._rotation = 0.0
+    def clear_calibration(self) -> None:
+        self._center = None
 
-    # -- calibration -------------------------------------------------------
-    def set_center(self):
-        """Use the current pose as neutral. Returns False if there is no valid current pose."""
-        if self._smoothed is None or self._missed > 0:
-            return False
-        self.center = tuple(self._smoothed)
-        self.center_is_set = True
-        self._recompute()
-        return True
+    def reset(self) -> None:
+        """Put the pointer back in the middle; the next valid frame jumps (no glide)."""
+        self._x = self._y = self._roll = 0.0
+        self._snap_next = True
 
-    def clear_center(self):
-        self.center = (0.0, 0.0, 0.0)
-        self.center_is_set = False
-        self._recompute()
+    def _state(self) -> PointerState:
+        return PointerState(self._x, self._y, self._roll, self._status, self.calibrated)
 
-    # -- per-frame update --------------------------------------------------
-    def update(self, angles):
-        """angles = (pitch, yaw, roll) in degrees, or None when no valid pose. Returns True if used."""
-        if angles is None or len(angles) != 3 or not all(math.isfinite(a) for a in angles):
-            self._missed += 1
-            if self._missed >= config.FACE_LOST_RESET_FRAMES:
-                self._smoothed = None
-            return False
+    def update(self, angles, now: float | None = None, snap: bool = False) -> PointerState:
+        """Feed the prediction of the CURRENT frame (or None). Returns the new state."""
+        now = time.monotonic() if now is None else now
+        valid = clean_angles(angles) if angles is not None else None
+        if valid is None:
+            self._last_angles = None
+            if self._last_valid_time is None:
+                self._status = WAITING
+            elif now - self._last_valid_time <= HOLD_SECONDS:
+                self._status = HOLDING
+            else:
+                self._status = LOST
+                self._snap_next = True  # do not glide from a stale position
+            self._last_update_time = now
+            return self._state()
 
-        self._missed = 0
-        if self._smoothed is None:
-            self._smoothed = tuple(float(a) for a in angles)
+        pitch0, yaw0, roll0 = self._center if self._center else (0.0, 0.0, 0.0)
+        pitch, yaw, roll = valid
+        s = self.settings
+        target_x = _clamp((yaw - yaw0) / s.yaw_range, 1.0)
+        target_y = _clamp((pitch - pitch0) / s.pitch_range, 1.0)
+        if s.invert_x:
+            target_x = -target_x
+        if s.invert_y:
+            target_y = -target_y
+        target_roll = _clamp(roll - roll0, MAX_ROLL_DISPLAY_DEG)
+
+        tau = s.smoothing_ms / 1000.0
+        dt = 0.0 if self._last_update_time is None else min(max(now - self._last_update_time, 0.0), 0.5)
+        if snap or self._snap_next or tau <= 0.0:
+            alpha = 1.0
         else:
-            keep = _clip(self.settings.smoothing, 0.0, 0.95)
-            self._smoothed = tuple(old + (1.0 - keep) * (new - old) for old, new in zip(self._smoothed, angles))
-        self._recompute()
-        return True
+            alpha = 1.0 - math.exp(-dt / tau)
+        self._x += alpha * (target_x - self._x)
+        self._y += alpha * (target_y - self._y)
+        self._roll += alpha * (target_roll - self._roll)
 
-    def refresh(self):
-        """Re-apply the current settings (call after a range or invert change)."""
-        self._recompute()
-
-    def _recompute(self):
-        if self._smoothed is None:
-            return
-        pitch, yaw, roll = (value - ref for value, ref in zip(self._smoothed, self.center))
-        x = yaw / max(self.settings.yaw_range, 1e-6)
-        y_up = pitch / max(self.settings.pitch_range, 1e-6)
-        if self.settings.invert_x:
-            x = -x
-        if self.settings.invert_y:
-            y_up = -y_up
-        self._position = (_clip(x, -1.0, 1.0), _clip(-y_up, -1.0, 1.0))
-        self._rotation = _clip(-roll, -90.0, 90.0)
+        self._snap_next = False
+        self._last_angles = valid
+        self._last_valid_time = now
+        self._last_update_time = now
+        self._status = TRACKING
+        return self._state()
